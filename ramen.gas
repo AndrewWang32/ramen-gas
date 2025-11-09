@@ -1,0 +1,717 @@
+/****************************************************
+ * 拉麵店候位系統（整合＋查詢＋每日人數上限＋單組上限＋額滿提示
+ *  ＋搬移非今日到 archive＋排序規則強化（保持 waiting/called 相對順序）
+ *  ＋取消即刻歸檔＋新增/叫號自動重排＋指定號碼叫號）
+ *
+ * 🔑 排序邏輯（reorderQueue）：
+ *   - 今日 Active：status 為 waiting/called 且「非過號」→ 保持原行序
+ *   - 今日 Skipped：status 為 waiting 且第7欄含 "SKIPPED " → 保持原行序
+ *   - 今日 Closed：status 為 done/cancelled → 保持原行序
+ *   - Others：非今日 → 保持原行序
+ *   合併順序：Active → Skipped → Closed → Others
+ *   ✅ 新增候位 appendRow 後，重排只做分段拼接，新加入會自然留在 Active 區塊底部。
+ *
+ * 🧮 當日人數上限（重要變更）：
+ *   - 「今日已使用人數」 = 今日 waiting + called + done 的人數總和
+ *   - canAcceptMoreToday / getTodayPeopleRemaining 都改用上述總和
+ ****************************************************/
+
+const SHEET_NAME = 'queue';
+const ARCHIVE_SHEET_NAME = 'archive';
+const PREFIX = 'A';
+const PROP = PropertiesService.getScriptProperties();
+
+/********** Spreadsheet 基本 **********/
+function getSpreadsheet() {
+  const sid = PROP.getProperty('SHEET_ID');
+  return sid ? SpreadsheetApp.openById(sid) : SpreadsheetApp.getActiveSpreadsheet();
+}
+function sheet() {
+  const ss = getSpreadsheet();
+  const sh = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['id','name','party_size','user_id','status','created_at','flag_or_notified']);
+  }
+  return sh;
+}
+function archiveSheet() {
+  const ss = getSpreadsheet();
+  const sh = ss.getSheetByName(ARCHIVE_SHEET_NAME) || ss.insertSheet(ARCHIVE_SHEET_NAME);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['id','name','party_size','user_id','status','created_at','flag_or_notified']);
+  }
+  return sh;
+}
+
+/********** 時間/旗標 **********/
+function nowISO() { return new Date().toISOString(); }
+function isTodayLocal(iso) {
+  if (!iso) return false;
+  const tz = Session.getScriptTimeZone() || 'Asia/Taipei';
+  const d = new Date(iso);
+  const today = new Date();
+  const ds = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  const ts = Utilities.formatDate(today, tz, 'yyyy-MM-dd');
+  return ds === ts;
+}
+function isSkippedFlag(row7) {
+  return typeof row7 === 'string' && row7.indexOf('SKIPPED ') === 0;
+}
+
+/********** 參數/限制 **********/
+function getAvgMinutesPerGroup() {
+  const v = Number(PROP.getProperty('AVG_MIN_PER_GROUP') || '10');
+  return isNaN(v) || v <= 0 ? 10 : v;
+}
+function getPartySizeMax() {
+  const v = Number(PROP.getProperty('PARTY_SIZE_MAX') || '5');
+  return (isNaN(v) || v <= 0) ? 5 : v;
+}
+
+/********** 資料存取 & 查找 **********/
+function nextTicket() {
+  const key = 'COUNTER';
+  let n = Number(PROP.getProperty(key) || '0');
+  n += 1;
+  PROP.setProperty(key, String(n));
+  return PREFIX + String(n).padStart(2, '0');
+}
+function getAll() {
+  const sh = sheet();
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  const values = sh.getRange(2, 1, last - 1, 7).getValues();
+  return values.map(r => ({
+    id: r[0], name: r[1], party_size: Number(r[2]), user_id: r[3],
+    status: r[4], created_at: r[5], flag_or_notified: r[6],
+  }));
+}
+function findByUser(userId) {
+  return getAll().find(r =>
+    r.user_id === userId && (r.status === 'waiting' || r.status === 'called')
+  );
+}
+function findRowById(id) {
+  const sh = sheet();
+  const last = sh.getLastRow();
+  if (last < 2) return -1;
+  const ids = sh.getRange(2, 1, last - 1, 1).getValues().map(v => v[0]);
+  const idx = ids.indexOf(id);
+  return idx === -1 ? -1 : idx + 2;
+}
+function positionOf(id) {
+  const waiting = getAll().filter(r => r.status === 'waiting');
+  return waiting.findIndex(r => r.id === id);
+}
+function getCurrentNumber() {
+  const cur = getAll().find(r => r.status === 'called');
+  return cur ? cur.id : null;
+}
+
+/********** 「今日人數」輔助（含 waiting/called/done） **********/
+function getTotalPeopleByStatusesToday(statuses) {
+  const set = new Set(statuses || []);
+  return getAll()
+    .filter(r => isTodayLocal(r.created_at) && set.has(r.status))
+    .reduce((sum, r) => sum + (Number(r.party_size) || 0), 0);
+}
+function getTotalGroupsByStatusesToday(statuses) {
+  const set = new Set(statuses || []);
+  return getAll()
+    .filter(r => isTodayLocal(r.created_at) && set.has(r.status))
+    .length;
+}
+function getTotalUsedPeopleToday() {
+  // 今日已使用人數 = waiting + called + done
+  return getTotalPeopleByStatusesToday(['waiting','called','done']);
+}
+
+/********** 新增/更新/取消/叫號 **********/
+function addWaiting(name, size, userId) {
+  const sh = sheet();
+  const id = nextTicket();
+  sh.appendRow([id, name, size, userId || '', 'waiting', nowISO(), '']);
+  reorderQueue(); // 新增後排在 Active 區塊底部
+  return { id, name, party_size: size, user_id: userId || '', status: 'waiting' };
+}
+function archiveById(id, statusOverride) {
+  const r = findRowById(id);
+  if (r === -1) return false;
+  const main = sheet();
+  const arch = archiveSheet();
+  const row = main.getRange(r, 1, 1, 7).getValues()[0];
+  row[4] = statusOverride || row[4] || 'cancelled';
+  arch.getRange(arch.getLastRow() + 1, 1, 1, 7).setValues([row]);
+  main.deleteRow(r);
+  return true;
+}
+function updateStatusById(id, status) {
+  if (status === 'cancelled') {
+    return archiveById(id, 'cancelled'); // 取消即刻歸檔
+  }
+  const r = findRowById(id);
+  if (r === -1) return false;
+  sheet().getRange(r, 5).setValue(status);
+  if (status === 'done') reorderQueue(); // 完成後重排（只拼段，不打亂 Active 內順序）
+  return true;
+}
+function uncallAllExcept(exceptId) {
+  const sh = sheet();
+  const last = sh.getLastRow();
+  if (last < 2) return 0;
+  const range = sh.getRange(2, 1, last - 1, 7);
+  const values = range.getValues();
+  let changed = 0;
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    if (row[4] === 'called' && row[0] !== exceptId) {
+      row[4] = 'waiting';
+      values[i] = row;
+      changed++;
+    }
+  }
+  if (changed > 0) range.setValues(values);
+  return changed;
+}
+function callNext() {
+  const next = getAll().find(r => r.status === 'waiting');
+  if (!next) return null;
+  uncallAllExcept(next.id);          // 單一叫號模式
+  updateStatusById(next.id, 'called');
+  linePush(next.user_id, [{ type: 'text', text: '輪到您囉！請至櫃檯報到（號碼：' + next.id + '）' }]);
+  reorderQueue();                    // 重排分段，但不改 Active 內相對順序
+  return next;
+}
+function callById(id) {
+  const r = findRowById(id);
+  if (r === -1) return { ok:false, reason:'not_found' };
+  const sh = sheet();
+  const row = sh.getRange(r, 1, 1, 7).getValues()[0];
+  const status = row[4];
+  if (status !== 'waiting' && status !== 'called') {
+    return { ok:false, reason:'not_waiting_or_called', status };
+  }
+  uncallAllExcept(row[0]);           // 單一叫號
+  sh.getRange(r, 5).setValue('called'); // 只改狀態，不移動行
+  const userId = row[3];
+  if (userId) linePush(userId, [{ type: 'text', text: '輪到您囉！請至櫃檯報到（號碼：' + row[0] + '）' }]);
+  reorderQueue();
+  return { ok:true, called: { id: row[0], name: row[1], party_size: row[2], user_id: userId } };
+}
+function cancelByUser(userId) {
+  const item = findByUser(userId);
+  if (!item || item.status !== 'waiting') return null;
+  updateStatusById(item.id, 'cancelled'); // 內部會 archive
+  return item;
+}
+
+/********** 過號（向下移 3 列 + 通知 + 標記 SKIPPED） **********/
+function skipIdDownThree(id) {
+  const sh = sheet();
+  const r = findRowById(id);
+  if (r === -1) return { ok: false, reason: 'not_found' };
+  const last = sh.getLastRow();
+  if (last < 2) return { ok: false, reason: 'empty' };
+
+  const row = sh.getRange(r, 1, 1, 7).getValues()[0];
+  const status = row[4];
+  const userId = row[3];
+  if (status !== 'waiting' && status !== 'called') {
+    return { ok: false, reason: 'not_waiting_or_called', status };
+  }
+
+  // 標記為過號
+  row[4] = 'waiting';
+  row[6] = 'SKIPPED ' + nowISO();
+
+  // 刪原列 → 下移 3 列插入（超出則 append）
+  sh.deleteRow(r);
+  const currentLast = sh.getLastRow();
+  const targetIndex = Math.min(r + 3, currentLast + 1);
+  const safeIndex = Math.max(2, targetIndex);
+  if (safeIndex === currentLast + 1) {
+    sh.appendRow(row);
+  } else {
+    sh.insertRowsBefore(safeIndex, 1);
+    sh.getRange(safeIndex, 1, 1, 7).setValues([row]);
+  }
+
+  const pos = positionOf(id);
+  const cur = getCurrentNumber();
+  const minutes = (pos >= 0) ? pos * getAvgMinutesPerGroup() : null;
+  const advice = (minutes !== null) ? ('\n建議於 ' + minutes + ' 分鐘內回到現場') : '';
+
+  if (userId) {
+    const msg =
+      '您已過號，號碼：' + id +
+      '\n目前號碼：' + (cur || '尚未叫號') +
+      '\n您的號碼：' + id +
+      '\n前面還有幾組：' + (pos >= 0 ? pos : '—') +
+      advice +
+      '\n如已到店，請盡速至櫃檯報到。';
+    linePush(userId, [{ type: 'text', text: msg }]);
+  }
+
+  reorderQueue();
+  return { ok: true, id, new_status: 'waiting', moved_to_row: safeIndex, position: pos };
+}
+
+/********** 排序（保持區段內原行序） **********/
+function reorderQueue() {
+  const sh = sheet();
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const values = sh.getRange(2, 1, last - 1, 7).getValues();
+  const todayActive = [];   // 今日 waiting/called（未過號）—保持原行序
+  const todaySkipped = [];  // 今日 waiting & SKIPPED —保持原行序
+  const todayClosed = [];   // 今日 done/cancelled —保持原行序
+  const others = [];        // 非今日 —保持原行序
+
+  for (const row of values) {
+    const status = row[4];
+    const createdAt = row[5];
+    const flag = row[6];
+
+    if (!isTodayLocal(createdAt)) {
+      others.push(row);
+      continue;
+    }
+    if (status === 'waiting' || status === 'called') {
+      if (status === 'waiting' && isSkippedFlag(flag)) {
+        todaySkipped.push(row);
+      } else {
+        todayActive.push(row);
+      }
+    } else if (status === 'done' || status === 'cancelled') {
+      todayClosed.push(row);
+    } else {
+      todayClosed.push(row);
+    }
+  }
+
+  const merged = todayActive.concat(todaySkipped, todayClosed, others);
+  if (last > 1) sh.getRange(2, 1, last - 1, 7).clearContent();
+  if (merged.length > 0) sh.getRange(2, 1, merged.length, 7).setValues(merged);
+}
+
+/********** 搬移非今日資料到 archive **********/
+function archiveOldRows() {
+  const main = sheet();
+  const arch = archiveSheet();
+  const last = main.getLastRow();
+  if (last < 2) return { moved: 0, kept: 0 };
+
+  const values = main.getRange(2, 1, last - 1, 7).getValues();
+  const toKeep = [];
+  const toMove = [];
+  for (const row of values) {
+    const createdAt = row[5];
+    if (isTodayLocal(createdAt)) toKeep.push(row);
+    else toMove.push(row);
+  }
+  if (toMove.length > 0) {
+    arch.getRange(arch.getLastRow() + 1, 1, toMove.length, 7).setValues(toMove);
+  }
+  if (last > 1) main.getRange(2, 1, last - 1, 7).clearContent();
+  if (toKeep.length > 0) main.getRange(2, 1, toKeep.length, 7).setValues(toKeep);
+  return { moved: toMove.length, kept: toKeep.length };
+}
+function setupDailyArchiveTrigger() {
+  const name = 'archiveOldRows';
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === name).forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger(name).timeBased().atHour(3).everyDays(1).create(); // 每天 03:00
+}
+
+/********** 統計 & 上限 **********/
+function getTotalWaitingGroups() {
+  return getAll().filter(r => r.status === 'waiting').length;
+}
+function getTotalWaitingPeople() {
+  return getAll().filter(r => r.status === 'waiting')
+    .reduce((sum, r) => sum + (Number(r.party_size) || 0), 0);
+}
+function getDailyPeopleLimitMap() {
+  try {
+    const raw = PROP.getProperty('DAILY_PEOPLE_LIMITS');
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch (e) { return {}; }
+}
+function setDailyPeopleLimit(weekday, people) {
+  const map = getDailyPeopleLimitMap();
+  map[String(weekday)] = Number(people);
+  PROP.setProperty('DAILY_PEOPLE_LIMITS', JSON.stringify(map));
+  return map;
+}
+function setDailyPeopleLimitFromJson(jsonStr) {
+  const obj = JSON.parse(jsonStr);
+  if (!obj || typeof obj !== 'object') throw new Error('invalid_json');
+  const map = {};
+  for (let k of Object.keys(obj)) {
+    if (!/^[0-6]$/.test(k)) continue;
+    const v = Number(obj[k]);
+    if (isNaN(v) || v <= 0) continue;
+    map[k] = v;
+  }
+  PROP.setProperty('DAILY_PEOPLE_LIMITS', JSON.stringify(map));
+  return map;
+}
+function getTodayPeopleLimit() {
+  const map = getDailyPeopleLimitMap();
+  const today = new Date().getDay(); // 0=Sun..6=Sat
+  const v = map.hasOwnProperty(String(today)) ? Number(map[String(today)]) : null;
+  return (v && v > 0) ? v : null;
+}
+/** 今日剩餘名額（人數）；未設定回 null。使用「今日 waiting+called+done」的人數總和。 */
+function getTodayPeopleRemaining() {
+  const limit = getTodayPeopleLimit();
+  if (limit === null) return null;
+  const used = getTotalUsedPeopleToday(); // waiting + called + done（僅今日）
+  return Math.max(0, limit - used);
+}
+/** 是否可接受新增 size 人（考量今日上限；未設定上限則一律可）。使用「今日 waiting+called+done」。 */
+function canAcceptMoreToday(size) {
+  const limit = getTodayPeopleLimit();
+  if (limit === null) return true;
+  const used = getTotalUsedPeopleToday();
+  return used + size <= limit;
+}
+
+/********** LINE API **********/
+function lineReply(replyToken, messages) {
+  const token = PROP.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) return;
+  UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify({ replyToken, messages }),
+    muteHttpExceptions: true,
+  });
+}
+function linePush(toUserId, messages) {
+  const token = PROP.getProperty('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) return;
+  if (!toUserId) return;
+  UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify({ to: toUserId, messages }),
+    muteHttpExceptions: true,
+  });
+}
+
+/********** Webhook (POST) for LINE **********/
+function doPost(e) {
+  try {
+    const raw = e.postData && e.postData.contents ? e.postData.contents : '{}';
+    const body = JSON.parse(raw);
+    const event = body.events && body.events[0];
+    if (!event) return ContentService.createTextOutput('OK');
+
+    if (event.type === 'message' && event.message && event.message.type === 'text') {
+      const replyToken = event.replyToken;
+      const userId = event.source && event.source.userId;
+      const text = (event.message.text || '').trim();
+      const reply = (msg) => lineReply(replyToken, [{ type: 'text', text: msg }]);
+
+      if (!userId) {
+        reply('無法取得使用者ID，請稍後再試');
+      } else if (text === '我要候位') {
+        const remaining = getTodayPeopleRemaining(); // 可能為 null（未設定上限）
+        const maxPerGroup = getPartySizeMax();
+        const used = getTotalUsedPeopleToday();      // 今日已累計（waiting+called+done）
+        const waitingPeople = getTotalWaitingPeople();
+
+        if (remaining !== null && remaining <= 0) {
+          const limit = getTodayPeopleLimit();
+          reply(
+            '很抱歉，今日候位已額滿 🙇‍♂️' +
+            '\n今日上限人數：' + limit + ' 人' +
+            '\n今日已累計人數（含叫號/完成）：' + used + ' 人' +
+            '\n目前等待人數：' + waitingPeople + ' 人' +
+            '\n建議：可改天再來，或現場視情況候補。感謝體諒！'
+          );
+        } else {
+          const extra = (remaining === null)
+            ? ''
+            : ('\n（今日剩餘名額：' + remaining + ' 人；已累計：' + used + ' 人）');
+          reply('請輸入 姓名/人數（單組上限 ' + maxPerGroup + ' 人），例如：王小明/2，請將小朋友也算進人數內！！填寫總人數！！' + extra);
+        }
+      } else if (text === '查詢') {
+        const groups = getTotalWaitingGroups();
+        const people = getTotalWaitingPeople();
+        const limitPeople = getTodayPeopleLimit();
+        const limitText = (limitPeople === null) ? '未設定' : String(limitPeople);
+        const used = getTotalUsedPeopleToday();
+
+        const item = findByUser(userId);
+        if (!item) {
+          reply(
+            '目前等待總組數：' + groups +
+            '\n目前等待總人數：' + people +
+            '\n今日上限人數：' + limitText +
+            '\n今日已累計人數（含叫號/完成）：' + used
+          );
+        } else {
+          let pos = (item.status === 'called') ? 0 : positionOf(item.id);
+          if (pos < 0) pos = 0;
+          const etaMin = pos * getAvgMinutesPerGroup();
+          reply(
+            '目前等待總組數：' + groups +
+            '\n目前等待總人數：' + people +
+            '\n今日上限人數：' + limitText +
+            '\n今日已累計人數（含叫號/完成）：' + used +
+            '\n前面還有幾組：' + pos +
+            '\n預計等待時間：' + etaMin + ' 分鐘'
+          );
+        }
+      } else if (text === '取消候位') {
+        const item = cancelByUser(userId);
+        if (!item) reply('找不到您的候位紀錄或已非等待中');
+        else reply('已為您取消並歸檔：' + item.id + '，期待下次光臨 🍜');
+      } else if (text.indexOf('/') !== -1) {
+        const parts = text.split('/');
+        const name = (parts[0] || '').trim();
+        const size = parseInt((parts[1] || '').replace(/[人位ppl人數]/g, ''), 10);
+        const maxSize = getPartySizeMax();
+
+        if (!name || !size || size <= 0) {
+          reply('格式錯誤，請輸入：姓名/人數（例：王小明/2）');
+        } else if (size > maxSize) {
+          reply('很抱歉，本店單組上限為 ' + maxSize + ' 人。\n若超過上限，請分成多組候位，感謝配合！');
+        } else if (!canAcceptMoreToday(size)) {
+          const limit = getTodayPeopleLimit();
+          const used = getTotalUsedPeopleToday();
+          const waiting = getTotalWaitingPeople();
+          const remaining = Math.max(0, (limit || 0) - used);
+          reply(
+            '很抱歉，今日候位人數已接近或超過上限。\n' +
+            '今日上限：' + limit + ' 人' +
+            '\n今日已累計人數（含叫號/完成）：' + used + ' 人' +
+            '\n目前等待人數：' + waiting + ' 人' +
+            '\n剩餘名額：' + remaining + ' 人' +
+            '\n如需候位，請分批或改日再來，謝謝理解。'
+          );
+        } else {
+          const exists = findByUser(userId);
+          if (exists) {
+            reply('您已在候位名單中，號碼：' + exists.id + '（輸入「查詢」查看進度，或「取消候位」取消）');
+          } else {
+            const item = addWaiting(name, size, userId); // 內含自動重排（新項在底部）
+            const pos = positionOf(item.id);
+            reply('已登記候位！\n號碼：' + item.id + '\n人數：' + size + '\n前面還有 ' + pos + ' 組');
+          }
+        }
+      } else {
+        reply('輸入「我要候位」開始；「查詢」看進度；「取消候位」可取消。');
+      }
+    }
+    return ContentService.createTextOutput('OK');
+  } catch (err) {
+    return ContentService.createTextOutput('OK'); // 出錯也回 200，避免 LINE 重試
+  }
+}
+
+/********** 管理端 / 健康檢查 (GET) **********
+ * health=1：不需 token
+ * 其餘 action 需 ADMIN_TOKEN：
+ *  - list
+ *  - call                 → 叫下一組（單一叫號、推播、重排）
+ *  - call&id=A05          → 指定號碼叫號（單一叫號、推播、重排）
+ *  - skip&id=A01          → 過號（向下移3列，推播，重排）
+ *  - cancel&id=A01        → 取消（立即移至 archive）
+ *  - done&id=A01          → 完成（重排）
+ *  - add&name=王小明&size=2&userId=Uxxx（可留空）
+ *  - getLimits / setLimit / setLimits
+ *  - reorder              → 只做分段拼接，不改動 waiting/called 相對順序
+ *  - archive              → 搬移「非今日」到 archive
+ *  - version
+ *************************************************/
+function doGet(e) {
+  const p = e.parameter || {};
+
+  if (p.health === '1') {
+    return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
+  }
+  if (p.action === 'version') {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true,
+      version: '2025-09-08T11:10+08:00',
+      features: [
+        'list+totals(people/groups)+limits',
+        'call(next & by-id, autoresort, single-call, keep-order)',
+        'skipDown3+notify+flag','cancel->archive','done(autoresort)',
+        'add(with party-size max & today-limit, autoresort, keep-order)',
+        'getLimits','setLimit','setLimits',
+        'query(people-limit)+ETA','lineReply/Push',
+        'reorder: keep waiting/called relative order; Active → Skipped → Closed → Others',
+        'archive: move non-today rows to archive',
+        'DAILY LIMIT: counts waiting+called+done'
+      ]
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  const token = p.token || '';
+  if (token !== PROP.getProperty('ADMIN_TOKEN')) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, reason: 'unauthorized' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  const action = (p.action || 'list').trim();
+
+  if (action === 'list') {
+    const queue = getAll();
+    const totals = {
+      groups: getTotalWaitingGroups(),
+      people: getTotalWaitingPeople(),
+      used_people_today: getTotalUsedPeopleToday() // NEW: 今日已累計（waiting+called+done）
+    };
+    const limits = {
+      today_people_limit: getTodayPeopleLimit(),
+      today_people_remaining: getTodayPeopleRemaining(),
+      weekly: getDailyPeopleLimitMap()
+    };
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, queue, totals, limits }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'call') {
+    const id = (p.id || '').trim().toUpperCase();
+    if (id) {
+      const r = callById(id);
+      return ContentService.createTextOutput(JSON.stringify({ ok: !!r.ok, result: r }))
+        .setMimeType(ContentService.MimeType.JSON);
+    } else {
+      const next = callNext();
+      return ContentService.createTextOutput(JSON.stringify({ ok: true, called: next }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+
+  if (action === 'skip') {
+    const id = (p.id || '').trim().toUpperCase();
+    const r = id ? skipIdDownThree(id) : { ok: false, reason: 'missing_id' };
+    return ContentService.createTextOutput(JSON.stringify({ ok: !!r.ok, result: r }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'cancel') {
+    const id = (p.id || '').trim().toUpperCase();
+    if (id) archiveById(id, 'cancelled');
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, cancelled: id || null, archived: !!id }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'done') {
+    const id = (p.id || '').trim().toUpperCase();
+    if (id) updateStatusById(id, 'done');
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, done: id || null }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'add') {
+    const name = (p.name || '').trim();
+    const size = parseInt((p.size || '0'), 10);
+    const userId = (p.userId || '').trim(); // 可留空
+    const maxSize = getPartySizeMax();
+
+    if (!name || !size || size <= 0) {
+      return ContentService.createTextOutput(JSON.stringify({ ok:false, reason:'invalid_params' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (size > maxSize) {
+      return ContentService.createTextOutput(JSON.stringify({ ok:false, reason:'party_size_exceeds_max', max:maxSize }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (!canAcceptMoreToday(size)) {
+      const limit = getTodayPeopleLimit();
+      const used = getTotalUsedPeopleToday();
+      const waiting = getTotalWaitingPeople();
+      const remaining = Math.max(0, (limit || 0) - used);
+      return ContentService.createTextOutput(JSON.stringify({
+        ok:false,
+        reason:'over_today_people_limit',
+        limit,
+        used_people: used,            // NEW
+        waiting_people: waiting,      // 保留相容
+        remaining
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    if (userId) {
+      const exists = findByUser(userId);
+      if (exists) {
+        return ContentService.createTextOutput(JSON.stringify({ ok:false, reason:'already_in_queue', id:exists.id }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+    const item = addWaiting(name, size, userId); // 內含自動重排（新項在底部）
+    const pos = positionOf(item.id);
+    return ContentService.createTextOutput(JSON.stringify({ ok:true, created:item, position:pos }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'getLimits') {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true,
+      weekly: getDailyPeopleLimitMap(),
+      today_people_limit: getTodayPeopleLimit(),
+      today_people_remaining: getTodayPeopleRemaining(),
+      used_people_today: getTotalUsedPeopleToday() // NEW
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'setLimit') {
+    const weekday = Number(p.weekday);
+    const people = Number(p.people);
+    if (isNaN(weekday) || weekday < 0 || weekday > 6 || isNaN(people) || people <= 0) {
+      return ContentService.createTextOutput(JSON.stringify({ ok:false, reason:'invalid_params' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    const map = setDailyPeopleLimit(weekday, people);
+    return ContentService.createTextOutput(JSON.stringify({ ok:true, weekly: map }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'setLimits') {
+    try {
+      const jsonStr = p.json || '';
+      const map = setDailyPeopleLimitFromJson(jsonStr);
+      return ContentService.createTextOutput(JSON.stringify({ ok:true, weekly: map }))
+        .setMimeType(ContentService.MimeType.JSON);
+    } catch (e) {
+      return ContentService.createTextOutput(JSON.stringify({ ok:false, reason:String(e) }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+
+  if (action === 'reorder') {
+    reorderQueue();
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, reordered: true }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'archive') {
+    const r = archiveOldRows();
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, archived: r }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // 未知 action → 回列表
+  const queue = getAll();
+  const totals = {
+    groups: getTotalWaitingGroups(),
+    people: getTotalWaitingPeople(),
+    used_people_today: getTotalUsedPeopleToday()
+  };
+  const limits = {
+    today_people_limit: getTodayPeopleLimit(),
+    today_people_remaining: getTodayPeopleRemaining(),
+    weekly: getDailyPeopleLimitMap()
+  };
+  return ContentService.createTextOutput(JSON.stringify({ ok: true, queue, totals, limits }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
